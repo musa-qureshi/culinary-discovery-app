@@ -1,5 +1,8 @@
 package com.culinary.backend.auth.repository;
 
+import com.culinary.backend.auth.dto.AdminUserSummaryResponse;
+import com.culinary.backend.auth.dto.ApprovedChefResponse;
+import com.culinary.backend.auth.dto.PendingChefResponse;
 import com.culinary.backend.auth.model.AccountStatus;
 import com.culinary.backend.auth.model.UserRecord;
 import com.culinary.backend.auth.model.UserRole;
@@ -11,6 +14,8 @@ import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -116,5 +121,143 @@ public class AuthRepository {
                 """,
                 userId
         );
+    }
+
+    public long countTotalUsers() {
+        return countByQuery("select count(*) from app_user");
+    }
+
+    public long countUsersByRole(UserRole role) {
+        return countByQuery("select count(*) from app_user where role = ?", role.name());
+    }
+
+    public long countUsersByStatus(AccountStatus status) {
+        return countByQuery("select count(*) from app_user where account_status = ?", status.name());
+    }
+
+    public long countPendingChefVerifications() {
+        return countByQuery("select count(*) from verified_chef_profile where verification_status = 'PENDING'");
+    }
+
+    public List<AdminUserSummaryResponse> listUsers(UserRole roleFilter, String searchTerm) {
+        StringBuilder sql = new StringBuilder(
+                """
+                select user_id, full_name, email, role, account_status, created_at
+                from app_user
+                where 1 = 1
+                """
+        );
+        List<Object> params = new ArrayList<>();
+
+        if (roleFilter != null) {
+            sql.append(" and role = ?");
+            params.add(roleFilter.name());
+        }
+
+        if (searchTerm != null && !searchTerm.isBlank()) {
+            sql.append(" and (lower(full_name) like ? or lower(email) like ?)");
+            String q = "%" + searchTerm.trim().toLowerCase() + "%";
+            params.add(q);
+            params.add(q);
+        }
+
+        sql.append(" order by created_at desc, user_id desc");
+
+        return jdbcTemplate.query(
+                sql.toString(),
+                (rs, rowNum) -> new AdminUserSummaryResponse(
+                        rs.getLong("user_id"),
+                        rs.getString("full_name"),
+                        rs.getString("email"),
+                        rs.getString("role"),
+                        rs.getString("account_status"),
+                        toLocalDateTime(rs.getObject("created_at"))
+                ),
+                params.toArray()
+        );
+    }
+
+    public List<PendingChefResponse> listPendingVerifiedChefs() {
+        return jdbcTemplate.query(
+                """
+                select u.user_id, u.full_name, u.email, p.bio, p.requested_at
+                from verified_chef_profile p
+                join app_user u on u.user_id = p.user_id
+                where p.verification_status = 'PENDING'
+                order by p.requested_at asc, u.user_id asc
+                """,
+                (rs, rowNum) -> new PendingChefResponse(
+                        rs.getLong("user_id"),
+                        rs.getString("full_name"),
+                        rs.getString("email"),
+                        rs.getString("bio"),
+                        toLocalDateTime(rs.getObject("requested_at"))
+                )
+        );
+    }
+
+    public List<ApprovedChefResponse> listApprovedVerifiedChefs() {
+        return jdbcTemplate.query(
+                """
+                select u.user_id, u.full_name, u.email, p.bio, p.requested_at, p.reviewed_at
+                from verified_chef_profile p
+                join app_user u on u.user_id = p.user_id
+                where p.verification_status = 'APPROVED'
+                order by p.reviewed_at desc, p.requested_at asc, u.user_id asc
+                """,
+                (rs, rowNum) -> new ApprovedChefResponse(
+                        rs.getLong("user_id"),
+                        rs.getString("full_name"),
+                        rs.getString("email"),
+                        rs.getString("bio"),
+                        toLocalDateTime(rs.getObject("requested_at")),
+                        toLocalDateTime(rs.getObject("reviewed_at"))
+                )
+        );
+    }
+
+    public int updateUserStatus(long userId, AccountStatus status) {
+        return jdbcTemplate.update(
+                """
+                update app_user
+                set account_status = ?
+                where user_id = ?
+                """,
+                status.name(),
+                userId
+        );
+    }
+
+    public int markVerifiedChefAsPending(long userId) {
+        return jdbcTemplate.update(
+                """
+                update verified_chef_profile
+                set verification_status = 'PENDING',
+                    reviewed_at = null,
+                    reviewed_by = null,
+                    review_note = null
+                where user_id = ? and verification_status = 'APPROVED'
+                """,
+                userId
+        );
+    }
+
+    public int deleteUserById(long userId) {
+        return jdbcTemplate.update("delete from app_user where user_id = ?", userId);
+    }
+
+    private long countByQuery(String sql, Object... args) {
+        Long count = jdbcTemplate.queryForObject(sql, Long.class, args);
+        return count == null ? 0L : count;
+    }
+
+    private LocalDateTime toLocalDateTime(Object rawValue) {
+        if (rawValue instanceof LocalDateTime value) {
+            return value;
+        }
+        if (rawValue instanceof java.sql.Timestamp ts) {
+            return ts.toLocalDateTime();
+        }
+        return null;
     }
 }

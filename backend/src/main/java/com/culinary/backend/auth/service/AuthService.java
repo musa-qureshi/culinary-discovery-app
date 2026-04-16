@@ -1,8 +1,12 @@
 package com.culinary.backend.auth.service;
 
 import com.culinary.backend.auth.dto.ApproveChefRequest;
+import com.culinary.backend.auth.dto.AdminDashboardStatsResponse;
+import com.culinary.backend.auth.dto.AdminUserSummaryResponse;
+import com.culinary.backend.auth.dto.ApprovedChefResponse;
 import com.culinary.backend.auth.dto.AuthResponse;
 import com.culinary.backend.auth.dto.LoginRequest;
+import com.culinary.backend.auth.dto.PendingChefResponse;
 import com.culinary.backend.auth.dto.RegisterRequest;
 import com.culinary.backend.auth.model.AccountStatus;
 import com.culinary.backend.auth.model.UserRecord;
@@ -13,6 +17,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
 
 @Service
 public class AuthService {
@@ -99,20 +105,127 @@ public class AuthService {
         );
     }
 
-    @Transactional
-    public AuthResponse approveVerifiedChef(long targetUserId, ApproveChefRequest request) {
-        UserRecord admin = authRepository.findUserById(request.adminUserId())
-                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "Admin user not found."));
+    public AdminDashboardStatsResponse getDashboardStats(long adminUserId) {
+        requireAdmin(adminUserId);
 
-        if (admin.role() != UserRole.ADMIN) {
-            throw new ApiException(HttpStatus.FORBIDDEN, "Only ADMIN users can approve verified chefs.");
+        return new AdminDashboardStatsResponse(
+                authRepository.countTotalUsers(),
+                authRepository.countUsersByRole(UserRole.HOME_COOK),
+                authRepository.countUsersByRole(UserRole.SUPPLIER),
+                authRepository.countUsersByRole(UserRole.VERIFIED_CHEF),
+                authRepository.countUsersByRole(UserRole.ADMIN),
+                authRepository.countPendingChefVerifications(),
+                authRepository.countUsersByStatus(AccountStatus.ACTIVE),
+                authRepository.countUsersByStatus(AccountStatus.BLOCKED)
+        );
+    }
+
+    public List<AdminUserSummaryResponse> listUsers(long adminUserId, String roleFilterRaw, String searchTerm) {
+        requireAdmin(adminUserId);
+
+        UserRole roleFilter = null;
+        if (roleFilterRaw != null && !roleFilterRaw.isBlank() && !"ALL".equalsIgnoreCase(roleFilterRaw.trim())) {
+            try {
+                roleFilter = UserRole.valueOf(roleFilterRaw.trim().toUpperCase());
+            } catch (IllegalArgumentException ex) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "Invalid role filter.");
+            }
         }
+
+        return authRepository.listUsers(roleFilter, searchTerm);
+    }
+
+    public List<PendingChefResponse> getPendingVerifiedChefs(long adminUserId) {
+        requireAdmin(adminUserId);
+        return authRepository.listPendingVerifiedChefs();
+    }
+
+    public List<ApprovedChefResponse> getApprovedVerifiedChefs(long adminUserId) {
+        requireAdmin(adminUserId);
+        return authRepository.listApprovedVerifiedChefs();
+    }
+
+    @Transactional
+    public void deleteUser(long adminUserId, long targetUserId) {
+        UserRecord admin = requireAdmin(adminUserId);
+
+        UserRecord target = authRepository.findUserById(targetUserId)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "Target user not found."));
+
+        if (target.userId() == admin.userId()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "You cannot delete your own admin account.");
+        }
+
+        if (target.role() == UserRole.ADMIN) {
+            throw new ApiException(HttpStatus.FORBIDDEN, "Admin users cannot be deleted from this endpoint.");
+        }
+
+        int deletedRows = authRepository.deleteUserById(targetUserId);
+        if (deletedRows == 0) {
+            throw new ApiException(HttpStatus.NOT_FOUND, "Target user not found.");
+        }
+    }
+
+    @Transactional
+    public void blockUser(long adminUserId, long targetUserId) {
+        UserRecord admin = requireAdmin(adminUserId);
+        UserRecord target = getBlockableTargetUser(admin, targetUserId);
+
+        if (target.accountStatus() == AccountStatus.BLOCKED) {
+            return;
+        }
+
+        authRepository.updateUserStatus(targetUserId, AccountStatus.BLOCKED);
+    }
+
+    @Transactional
+    public void unblockUser(long adminUserId, long targetUserId) {
+        UserRecord admin = requireAdmin(adminUserId);
+        UserRecord target = getBlockableTargetUser(admin, targetUserId);
+
+        if (target.accountStatus() == AccountStatus.PENDING_VERIFICATION) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "Pending verified chefs cannot be unblocked.");
+        }
+
+        if (target.accountStatus() == AccountStatus.ACTIVE) {
+            return;
+        }
+
+        authRepository.updateUserStatus(targetUserId, AccountStatus.ACTIVE);
+    }
+
+    @Transactional
+    public void markVerifiedChefPending(long adminUserId, long targetUserId) {
+        requireAdmin(adminUserId);
 
         UserRecord chef = authRepository.findUserById(targetUserId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "Target user not found."));
 
         if (chef.role() != UserRole.VERIFIED_CHEF) {
             throw new ApiException(HttpStatus.BAD_REQUEST, "Target user is not a VERIFIED_CHEF.");
+        }
+
+        int updatedRows = authRepository.markVerifiedChefAsPending(targetUserId);
+        if (updatedRows == 0) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "Verified chef is already pending or not approved.");
+        }
+
+        authRepository.updateUserStatus(targetUserId, AccountStatus.PENDING_VERIFICATION);
+    }
+
+    @Transactional
+    public AuthResponse approveVerifiedChef(long targetUserId, ApproveChefRequest request) {
+        requireAdmin(request.adminUserId());
+
+        UserRecord chef = authRepository.findUserById(targetUserId)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "Target user not found."));
+
+        if (chef.role() != UserRole.VERIFIED_CHEF) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "Target user is not a VERIFIED_CHEF.");
+        }
+
+        if (chef.accountStatus() != AccountStatus.PENDING_VERIFICATION) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "Verified chef is not pending verification.");
         }
 
         authRepository.approveVerifiedChef(targetUserId, request.adminUserId(), request.reviewNote());
@@ -125,5 +238,35 @@ public class AuthService {
                 AccountStatus.ACTIVE.name(),
                 "Verified chef approved and account activated."
         );
+    }
+
+    private UserRecord requireAdmin(long adminUserId) {
+        UserRecord admin = authRepository.findUserById(adminUserId)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "Admin user not found."));
+
+        if (admin.role() != UserRole.ADMIN) {
+            throw new ApiException(HttpStatus.FORBIDDEN, "Only ADMIN users can perform this action.");
+        }
+
+        return admin;
+    }
+
+    private UserRecord getBlockableTargetUser(UserRecord admin, long targetUserId) {
+        UserRecord target = authRepository.findUserById(targetUserId)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "Target user not found."));
+
+        if (target.userId() == admin.userId()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "You cannot change your own admin account status.");
+        }
+
+        if (target.role() == UserRole.ADMIN) {
+            throw new ApiException(HttpStatus.FORBIDDEN, "Admin users cannot be blocked or unblocked from this endpoint.");
+        }
+
+        if (target.role() == UserRole.VERIFIED_CHEF && target.accountStatus() == AccountStatus.PENDING_VERIFICATION) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "Pending verified chefs cannot be blocked or unblocked.");
+        }
+
+        return target;
     }
 }
