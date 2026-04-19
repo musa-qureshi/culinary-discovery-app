@@ -91,9 +91,13 @@ public class AuthService {
             throw new ApiException(HttpStatus.UNAUTHORIZED, "Invalid email or password.");
         }
 
-        if (user.accountStatus() != AccountStatus.ACTIVE) {
-            throw new ApiException(HttpStatus.FORBIDDEN, "Account is not active. Current status: " + user.accountStatus().name());
+        if (user.accountStatus() == AccountStatus.BLOCKED) {
+            throw new ApiException(HttpStatus.FORBIDDEN, "Your account has been blocked.");
         }
+
+        String message = user.accountStatus() == AccountStatus.PENDING_VERIFICATION
+                ? "Your Verified Chef account is pending admin verification."
+                : "Login successful.";
 
         return new AuthResponse(
                 user.userId(),
@@ -101,7 +105,7 @@ public class AuthService {
                 user.email(),
                 user.role().name(),
                 user.accountStatus().name(),
-                "Login successful."
+                message
         );
     }
 
